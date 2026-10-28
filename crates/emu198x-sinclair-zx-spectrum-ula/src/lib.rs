@@ -1345,3 +1345,660 @@ mod fuse_floating_bus_differential {
         }
     }
 }
+
+#[cfg(test)]
+mod engine_paths {
+    use super::*;
+    use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
+    use emu198x_bus_sinclair_zx_spectrum::timing::SCREEN_WIDTH_HIRES;
+
+    /// A flat 64K address space, so a test can place known bytes at the
+    /// exact addresses the engine is expected to fetch.
+    struct Ram(Vec<u8>);
+    impl Ram {
+        fn with(bytes: &[(u16, u8)]) -> Self {
+            let mut ram = Ram(vec![0; 0x1_0000]);
+            for &(addr, value) in bytes {
+                ram.write(addr, value);
+            }
+            ram
+        }
+    }
+    impl MemoryBus for Ram {
+        fn read(&self, addr: u16) -> u8 {
+            self.0[usize::from(addr)]
+        }
+        fn write(&mut self, addr: u16, value: u8) {
+            self.0[usize::from(addr)] = value;
+        }
+        fn is_contended(&self, _addr: u16) -> bool {
+            false
+        }
+    }
+
+    /// A value the framebuffer starts filled with, so a test can tell
+    /// which cells the engine wrote.
+    const UNTOUCHED: u8 = 0x55;
+
+    fn standard_fb() -> Vec<u8> {
+        vec![UNTOUCHED; SCREEN_WIDTH * SCREEN_HEIGHT]
+    }
+
+    fn wide_fb() -> Vec<u8> {
+        vec![UNTOUCHED; SCREEN_WIDTH_HIRES * SCREEN_HEIGHT]
+    }
+
+    /// `UlaConfig` constants are inlined at each use, so compare timing by
+    /// value rather than by address.
+    fn same_timing(a: &UlaConfig, b: &UlaConfig) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
+    /// Tick until the engine's pixel counter reads `pixel`.
+    fn tick_until(e: &mut UlaEngine, mem: &dyn MemoryBus, fb: &mut [u8], pixel: u16) {
+        while e.pixel != pixel {
+            e.tick_rendering(mem, fb, None);
+        }
+    }
+
+    /// The table builder is a `const fn`, so the constant is computed at
+    /// compile time. Running it here checks the stated rule directly:
+    /// `C2 + C3` over a 16-pixel cycle is low for counter values 0..=3
+    /// and high for 4..=15.
+    #[test]
+    fn delay_table_48k_is_c2_or_c3_of_the_fetch_counter() {
+        let built = clkwait_from_counter_bits();
+        assert_eq!(built, DELAY_TABLE_48K);
+        for (pixel, &wait) in built.iter().enumerate() {
+            assert_eq!(wait, pixel >= 4, "pixel {pixel}");
+        }
+    }
+
+    /// The +2A table is the measured window its doc comment describes:
+    /// eleven asserted half-cycles from pixel 4, free over 15 and 0-3.
+    #[test]
+    fn delay_table_plus2a_is_eleven_half_cycles_from_pixel_4() {
+        let asserted: Vec<usize> = (0..16).filter(|&p| DELAY_TABLE_PLUS2A[p]).collect();
+        assert_eq!(asserted, (4..15).collect::<Vec<_>>());
+    }
+
+    /// One serialisable field value, for a deserializer that needs no
+    /// format crate.
+    enum Field {
+        U(u64),
+        B(bool),
+    }
+    impl<'de> serde::de::IntoDeserializer<'de, serde::de::value::Error> for Field {
+        type Deserializer = Self;
+        fn into_deserializer(self) -> Self {
+            self
+        }
+    }
+    impl<'de> serde::Deserializer<'de> for Field {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            match self {
+                Field::U(n) => visitor.visit_u64(n),
+                Field::B(b) => visitor.visit_bool(b),
+            }
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map struct enum identifier ignored_any
+        }
+    }
+
+    /// A restored engine has no timing config of its own: the field is
+    /// skipped, so it falls back to 48K timing until the machine calls
+    /// `set_config`. The skipped pipeline fields come back as zero.
+    #[test]
+    fn deserialized_engine_uses_48k_timing_until_set_config() {
+        use Field::{B, U};
+        // Every serialised field, in declaration order.
+        let fields = vec![
+            U(447),  // pixel
+            U(10),   // scan
+            U(2),    // border
+            B(true), // beeper
+            B(false),
+            U(3), // flash_counter
+            B(false),
+            B(true), // cpu_clock
+            B(true), // z80_clock_high
+            B(false),
+            U(0xFF), // bus_data
+            B(true), // idle
+            U(0),
+            U(0),
+            U(0),
+            U(0),
+            U(0), // data_addr
+            U(0),
+            B(false), // video
+            B(true),  // border_active
+            B(false),
+            B(false),
+            B(false),
+            B(false),
+            B(false),
+            U(SCREEN_WIDTH as u64), // fb_width
+            U(0),
+            U(0),
+            U(0),
+            U(0),
+        ];
+        let de = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
+            fields.into_iter(),
+        );
+        let mut e: UlaEngine = serde::Deserialize::deserialize(de).expect("engine deserializes");
+
+        assert!(same_timing(e.config, &CONFIG_48K));
+        assert_eq!(
+            (e.pixel, e.scan, e.border, e.flash_counter),
+            (447, 10, 2, 3)
+        );
+        assert_eq!(e.border_aolatch, 0, "skipped AOLatch defaults to zero");
+        assert_eq!(e.mcycle_fall, 0);
+
+        // A 48K line has 448 pixels, so pixel 447 wraps to the next line.
+        let mem = Ram::with(&[]);
+        let mut fb = standard_fb();
+        let mut wrapped = e.clone();
+        wrapped.tick_rendering(&mem, &mut fb, None);
+        assert_eq!((wrapped.pixel, wrapped.scan), (0, 11));
+
+        // Under 128K timing the same pixel is not the end of the line.
+        e.set_config(&CONFIG_128K);
+        assert!(same_timing(e.config, &CONFIG_128K));
+        e.tick_rendering(&mem, &mut fb, None);
+        assert_eq!((e.pixel, e.scan), (448, 10));
+    }
+
+    #[test]
+    fn new_hires_differs_from_new_only_in_framebuffer_width() {
+        let standard = UlaEngine::new(&CONFIG_TIMEX_PAL);
+        let hires = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+        assert_eq!(standard.fb_width, SCREEN_WIDTH);
+        assert_eq!(hires.fb_width, SCREEN_WIDTH_HIRES);
+        assert!(same_timing(hires.config, &CONFIG_TIMEX_PAL));
+        assert_eq!(hires.border, standard.border);
+        assert_eq!(hires.scld_mode, 0);
+        assert!(hires.cpu_clock && hires.border_active && !hires.video);
+    }
+
+    /// One whole 48K display line: checkpoint flags, fetch addresses,
+    /// the two-stage pipeline's output and the border either side.
+    #[test]
+    fn a_48k_display_line_renders_its_first_two_cells_and_border() {
+        let mem = Ram::with(&[
+            (0x4000, 0xA0), // bitmap column 0: 1010_0000
+            (0x5800, 0x0A), // paper 1, ink 2
+            (0x4001, 0x0F), // bitmap column 1: 0000_1111
+            (0x5801, 0x47), // bright, paper 0, ink 7
+        ]);
+        let mut fb = standard_fb();
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.write_fe(3);
+
+        // Pixel 0 of a display line clears the border flag.
+        e.tick_rendering(&mem, &mut fb, None);
+        assert!(!e.border_active);
+        assert!(!e.video, "the fetch window has not opened yet");
+
+        // `fetch_start` opens the window and loads the line's addresses;
+        // the first bitmap fetch happens on the same tick.
+        tick_until(&mut e, &mem, &mut fb, 8);
+        e.tick_rendering(&mem, &mut fb, None);
+        assert!(e.video);
+        assert!(!e.idle);
+        assert_eq!(e.bus_data, 0xA0, "bitmap fetch at phase 8");
+        assert_eq!(e.data_addr, 0x0001);
+        assert_eq!(e.attr_addr, 0x1800);
+        tick_until(&mut e, &mem, &mut fb, 11);
+        assert_eq!(e.bus_data, 0x0A, "attribute fetch at phase 10");
+
+        // Pixel 256 raises the border flag; fetching carries on to 264.
+        tick_until(&mut e, &mem, &mut fb, 257);
+        assert!(e.border_active);
+        assert!(e.video);
+        tick_until(&mut e, &mem, &mut fb, 265);
+        assert!(!e.video);
+        assert!(e.idle);
+        assert_eq!(e.bus_data, 0xFF, "the bus floats high outside the fetch");
+        assert_eq!(e.data_addr, 0x0020, "32 bitmap fetches per line");
+        assert_eq!(e.attr_addr, 0x1820, "32 attribute fetches per line");
+
+        tick_until(&mut e, &mem, &mut fb, 0);
+        assert_eq!(e.scan, 1);
+
+        let row = &fb[48 * SCREEN_WIDTH..49 * SCREEN_WIDTH];
+        // Pixels 0-3 precede the first AOLatch trigger, so they show the
+        // power-on colour; from pixel 4 the written border shows.
+        assert_eq!(&row[36..40], &[7, 7, 7, 7]);
+        assert_eq!(&row[40..48], &[3; 8]);
+        // Screen starts at pixel 12 (x = 48).
+        assert_eq!(&row[48..56], &[2, 1, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(&row[56..64], &[8, 8, 8, 8, 15, 15, 15, 15]);
+        // Pixel 268 is right border; 315 is the last before HBlank.
+        assert_eq!(row[304], 3);
+        assert_eq!(row[351], 3);
+        // Pixels 412..447 wrap to the left edge of the same row.
+        assert_eq!(&row[0..36], &[3; 36]);
+    }
+
+    /// On the bottom-border lines the fetch window never opens.
+    #[test]
+    fn border_lines_never_open_the_fetch_window() {
+        let mem = Ram::with(&[(0x4000, 0xA0)]);
+        let mut fb = standard_fb();
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.scan = 192;
+        e.border_active = false;
+        e.tick_rendering(&mem, &mut fb, None);
+        assert!(e.border_active, "pixel 0 sets the border flag at scan 192");
+        tick_until(&mut e, &mem, &mut fb, 9);
+        assert!(!e.video);
+        assert!(e.border_active);
+        assert_eq!(e.bus_data, 0xFF);
+        assert_eq!(e.data_addr, 0);
+    }
+
+    /// The framebuffer row follows the scan: display and bottom border
+    /// sit 48 rows down, VSync lines are not drawn, and the lines after
+    /// VSync are the top border at row 0.
+    #[test]
+    fn framebuffer_rows_and_columns_follow_the_48k_geometry() {
+        let mem = Ram::with(&[]);
+        let draw = |scan: u16, pixel: u16| {
+            let mut fb = standard_fb();
+            let mut e = UlaEngine::new(&CONFIG_48K);
+            e.scan = scan;
+            e.pixel = pixel;
+            e.border_aolatch = 5;
+            e.border = 5;
+            e.tick_rendering(&mem, &mut fb, None);
+            fb.iter()
+                .position(|&v| v != UNTOUCHED)
+                .map(|i| (i % SCREEN_WIDTH, i / SCREEN_WIDTH))
+        };
+        assert_eq!(draw(200, 0), Some((36, 248)), "bottom border");
+        assert_eq!(draw(247, 0), Some((36, 295)), "last row before VSync");
+        assert_eq!(draw(248, 0), None, "VSync starts");
+        assert_eq!(draw(263, 0), None, "VSync's last line");
+        assert_eq!(draw(264, 0), Some((36, 0)), "top border starts");
+        assert_eq!(draw(300, 0), Some((36, 36)));
+        assert_eq!(draw(300, 315), Some((351, 36)), "last pixel before HBlank");
+        assert_eq!(draw(300, 316), None, "HBlank");
+        assert_eq!(draw(300, 411), None, "HBlank");
+        assert_eq!(draw(300, 412), Some((0, 36)), "wrapped left border");
+        assert_eq!(draw(300, 447), Some((35, 36)));
+    }
+
+    /// The shift register keeps clocking through screen pixels that land
+    /// outside the framebuffer, so it stays in step with the raster.
+    #[test]
+    fn shifter_clocks_through_screen_pixels_outside_the_framebuffer() {
+        static HIDDEN_FROM_14: UlaConfig = UlaConfig {
+            fb_x_hblank_start: 14,
+            ..CONFIG_48K
+        };
+        let mem = Ram::with(&[]);
+        let mut fb = standard_fb();
+        let mut e = UlaEngine::new(&HIDDEN_FROM_14);
+        e.pixel = 12;
+        e.data_latch_pending = 0xB4; // 1011_0100
+        e.attr_latch_pending = 0x38; // paper 7, ink 0
+
+        // Pixels 12 and 13 are drawn from the top two bits.
+        e.tick_rendering(&mem, &mut fb, None);
+        e.tick_rendering(&mem, &mut fb, None);
+        let row = 48 * SCREEN_WIDTH;
+        assert_eq!(&fb[row + 48..row + 50], &[0, 7]);
+
+        // Pixels 14 and 15 are hidden, but still shift.
+        e.tick_rendering(&mem, &mut fb, None);
+        e.tick_rendering(&mem, &mut fb, None);
+        assert_eq!(e.data_reg, 0xB4 << 4);
+        assert_eq!(fb[row + 50], UNTOUCHED);
+
+        // In hi-res mode the second register shifts with the first.
+        e.scld_mode = 0x04;
+        e.data_reg = 0x80;
+        e.data_reg2 = 0xC0;
+        e.tick_rendering(&mem, &mut fb, None);
+        assert_eq!((e.data_reg, e.data_reg2), (0x00, 0x80));
+    }
+
+    /// Each SCLD mode reads its bitmap and attributes from its own area.
+    /// Scan 9's first column has bitmap offset $0120 and attribute
+    /// offset $1820.
+    #[test]
+    fn scld_modes_fetch_from_their_own_screen_areas() {
+        let mem = Ram::with(&[
+            (0x4120, 0x11),
+            (0x5820, 0x22),
+            (0x6120, 0x33),
+            (0x7820, 0x44),
+        ]);
+        // Timex PAL fetches bitmap at pixel 4 and attribute at pixel 6.
+        let fetch = |scld_mode: u8| {
+            let mut fb = standard_fb();
+            let mut e = UlaEngine::new(&CONFIG_TIMEX_PAL);
+            e.scan = 9;
+            e.pixel = 4;
+            e.scld_mode = scld_mode;
+            e.tick_rendering(&mem, &mut fb, None);
+            let bitmap = (e.data_latch_pending, e.data_latch_pending2);
+            tick_until(&mut e, &mem, &mut fb, 7);
+            (bitmap, e.attr_latch_pending, e.bus_data)
+        };
+        assert_eq!(fetch(0x00), ((0x11, 0), 0x22, 0x22), "standard");
+        assert_eq!(fetch(0x01), ((0x33, 0), 0x44, 0x44), "dual screen");
+        assert_eq!(
+            fetch(0x02),
+            ((0x11, 0), 0x33, 0x33),
+            "hi-colour: one attribute per pixel row, from $6000"
+        );
+        assert_eq!(
+            fetch(0x04),
+            ((0x11, 0x33), 0xFF, 0xFF),
+            "hi-res: both screens' bitmaps, no attribute"
+        );
+    }
+
+    /// Hi-res on a wide framebuffer draws two pixels per ULA clock: the
+    /// even one from the $4000 screen and the odd one from $6000, both in
+    /// the port $FF ink.
+    #[test]
+    fn hires_interleaves_both_screens_on_a_wide_framebuffer() {
+        let mem = Ram::with(&[(0x4000, 0xF0), (0x6000, 0x3C)]);
+        let mut fb = wide_fb();
+        let mut e = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+        e.scld_mode = 0x04;
+        e.scld_hires_ink = 5;
+        tick_until(&mut e, &mem, &mut fb, 20);
+
+        let row = 48 * SCREEN_WIDTH_HIRES;
+        // Border pixels are doubled: pixel 0 covers x = 72 and 73.
+        assert_eq!(&fb[row + 72..row + 74], &[7, 7]);
+        // Screen pixel 12 starts at x = (12 + 36) * 2 = 96.
+        let even = [5, 5, 5, 5, 0, 0, 0, 0];
+        let odd = [0, 0, 5, 5, 5, 5, 0, 0];
+        for i in 0..8 {
+            assert_eq!(fb[row + 96 + 2 * i], even[i], "even pixel {i}");
+            assert_eq!(fb[row + 97 + 2 * i], odd[i], "odd pixel {i}");
+        }
+    }
+
+    /// Standard rendering on a wide framebuffer doubles every pixel.
+    #[test]
+    fn standard_pixels_are_doubled_on_a_wide_framebuffer() {
+        let mem = Ram::with(&[(0x4000, 0xA0), (0x5800, 0x0A)]);
+        let mut fb = wide_fb();
+        let mut e = UlaEngine::new_hires(&CONFIG_48K);
+        tick_until(&mut e, &mem, &mut fb, 20);
+
+        let row = 48 * SCREEN_WIDTH_HIRES;
+        assert_eq!(
+            &fb[row + 96..row + 112],
+            &[2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        );
+    }
+
+    /// A framebuffer shorter than the geometry implies is never written
+    /// past its end: border and screen pixels that fall beyond it are
+    /// dropped instead of panicking.
+    #[test]
+    fn a_short_framebuffer_is_never_written_past_its_end() {
+        let mem = Ram::with(&[(0x4000, 0xFF), (0x5800, 0x07)]);
+        for mut e in [
+            UlaEngine::new(&CONFIG_48K),
+            UlaEngine::new_hires(&CONFIG_48K),
+        ] {
+            let mut fb = vec![UNTOUCHED; 16];
+            for _ in 0..448 {
+                e.tick_rendering(&mem, &mut fb, None);
+            }
+            assert_eq!((e.scan, e.pixel), (1, 0));
+            assert_eq!(fb, [UNTOUCHED; 16], "row 48 lies beyond the buffer");
+        }
+    }
+
+    /// With the flash phase active, a FLASH attribute swaps ink and paper.
+    #[test]
+    fn flash_swaps_ink_and_paper_when_active() {
+        let mem = Ram::with(&[(0x4000, 0xF0), (0x5800, 0x80 | 0x0A)]);
+        let render = |flash_active: bool| {
+            let mut fb = standard_fb();
+            let mut e = UlaEngine::new(&CONFIG_48K);
+            e.flash_active = flash_active;
+            tick_until(&mut e, &mem, &mut fb, 20);
+            fb[48 * SCREEN_WIDTH + 48..48 * SCREEN_WIDTH + 56].to_vec()
+        };
+        assert_eq!(render(false), [2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(render(true), [1, 1, 1, 1, 2, 2, 2, 2]);
+    }
+
+    /// Run from pixel 0 of the interrupt line and report the pixel
+    /// counter after the tick that raised INT, and how many ticks it
+    /// stayed raised.
+    fn interrupt_pulse(config: &'static UlaConfig) -> (u16, usize) {
+        let mem = Ram::with(&[]);
+        let mut fb = standard_fb();
+        let mut e = UlaEngine::new(config);
+        e.scan = config.int_scan;
+        let mut first = None;
+        let mut ticks = 0;
+        for _ in 0..200 {
+            e.tick_rendering(&mem, &mut fb, None);
+            if e.int_active {
+                first.get_or_insert(e.pixel);
+                ticks += 1;
+            }
+        }
+        assert!(!e.int_active, "INT has fallen again");
+        (first.expect("INT was raised"), ticks)
+    }
+
+    /// Configurations with `fetch_start` 8 evaluate INT before the counter
+    /// advances, the others after. Pulse lengths are two ULA pixels per
+    /// T-state: 32 T-states for 48K, 36 for the 128K and grey +2, 32 for
+    /// the +2A.
+    #[test]
+    fn interrupt_pulses_match_each_configuration() {
+        assert_eq!(interrupt_pulse(&CONFIG_48K), (2, 64));
+        assert_eq!(interrupt_pulse(&CONFIG_128K), (6, 72));
+        assert_eq!(interrupt_pulse(&CONFIG_PLUS2), (4, 72));
+        assert_eq!(interrupt_pulse(&CONFIG_PLUS2A), (1, 64));
+        assert_eq!(interrupt_pulse(&CONFIG_PENTAGON), (1, 64));
+        assert_eq!(interrupt_pulse(&CONFIG_TS2068), (1, 64));
+    }
+
+    #[test]
+    fn interrupt_is_not_raised_on_other_lines() {
+        let mem = Ram::with(&[]);
+        let mut fb = standard_fb();
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.scan = 247;
+        for _ in 0..448 {
+            e.tick_rendering(&mem, &mut fb, None);
+            assert!(!e.int_active);
+        }
+        assert_eq!(e.scan, 248);
+    }
+
+    #[test]
+    fn the_counter_wraps_at_the_end_of_each_line_and_frame() {
+        let mem = Ram::with(&[]);
+        let mut fb = standard_fb();
+        let after = |config: &'static UlaConfig, scan: u16, pixel: u16| {
+            let mut fb2 = standard_fb();
+            let mut e = UlaEngine::new(config);
+            e.scan = scan;
+            e.pixel = pixel;
+            e.tick_rendering(&mem, &mut fb2, None);
+            (e.scan, e.pixel)
+        };
+        assert_eq!(after(&CONFIG_48K, 311, 447), (0, 0));
+        assert_eq!(after(&CONFIG_128K, 310, 455), (0, 0));
+        assert_eq!(after(&CONFIG_128K, 311 - 1, 447), (310, 448));
+        assert_eq!(after(&CONFIG_PENTAGON, 319, 447), (0, 0));
+        assert_eq!(after(&CONFIG_TS2068, 261, 447), (0, 0));
+        // A plain mid-frame tick only advances the pixel.
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.tick_rendering(&mem, &mut fb, None);
+        assert_eq!((e.scan, e.pixel), (0, 1));
+    }
+
+    #[test]
+    fn end_frame_toggles_flash_every_16_frames_and_rewinds_the_raster() {
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.pixel = 100;
+        e.scan = 200;
+        e.end_frame();
+        assert_eq!((e.pixel, e.scan), (0, 0));
+        assert_eq!(e.flash_counter, 1);
+        for _ in 1..15 {
+            e.end_frame();
+        }
+        assert_eq!(e.flash_counter, 15);
+        assert!(!e.flash_active);
+        e.end_frame();
+        assert_eq!(e.flash_counter, 16);
+        assert!(e.flash_active);
+        for _ in 16..31 {
+            e.end_frame();
+        }
+        assert!(e.flash_active, "still inverted at frame 31");
+        e.end_frame();
+        assert_eq!(e.flash_counter, 0, "the counter wraps at 32");
+        assert!(!e.flash_active);
+    }
+
+    #[test]
+    fn read_fe_ands_the_selected_keyboard_rows() {
+        let e = UlaEngine::new(&CONFIG_48K);
+        let mut keys = [0xFF; 8];
+        assert_eq!(e.read_fe(0x00FE, &keys), 0xFF, "no key pressed");
+
+        keys[0] = 0xFE; // row 0, bit 0
+        keys[3] = 0xFD; // row 3, bit 1
+        assert_eq!(e.read_fe(0xFEFE, &keys), 0xFE, "row 0 selected");
+        assert_eq!(e.read_fe(0xF7FE, &keys), 0xFD, "row 3 selected");
+        assert_eq!(e.read_fe(0x7FFE, &keys), 0xFF, "row 7 only");
+        assert_eq!(e.read_fe(0x00FE, &keys), 0xFC, "all rows");
+
+        // Only bits 0-4 come from the keyboard; bits 5-7 always read high.
+        keys[0] = 0x1E;
+        assert_eq!(e.read_fe(0xFEFE, &keys), 0xFE);
+    }
+
+    #[test]
+    fn track_z80_clock_latches_strobes_on_the_rising_edge_only() {
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        assert!(e.z80_clock_high);
+        assert!(!e.gate_arms_this_halfcycle());
+
+        // Falling edge: history moves, the T2/T3 latches do not.
+        e.track_z80_clock(false, true, true);
+        assert!(!e.z80_clock_high);
+        assert!(e.gate_arms_this_halfcycle());
+        assert!(e.z80_mreq_prev);
+        assert!(!e.mreq_t23 && !e.ioreq_tw3);
+
+        // Rising edge: both latches take the pins.
+        e.track_z80_clock(true, true, true);
+        assert!(e.z80_clock_high);
+        assert!(e.mreq_t23 && e.ioreq_tw3);
+        assert!(e.z80_iorq_prev && !e.z80_iorq_prev2);
+
+        // Next falling edge: latches hold, IORQ history shifts.
+        e.track_z80_clock(false, false, false);
+        assert!(e.mreq_t23 && e.ioreq_tw3);
+        assert!(!e.z80_iorq_prev && e.z80_iorq_prev2);
+        assert!(!e.z80_mreq_prev);
+
+        // A stalled CPU freezes everything.
+        e.cpu_clock = false;
+        e.track_z80_clock(true, true, false);
+        assert!(!e.z80_clock_high);
+        assert!(!e.z80_iorq_prev && e.z80_iorq_prev2 && !e.z80_mreq_prev);
+
+        // Released, the next rising edge drops the latches.
+        e.cpu_clock = true;
+        e.track_z80_clock(false, false, false);
+        assert!(e.z80_clock_high);
+        assert!(!e.mreq_t23 && !e.ioreq_tw3);
+    }
+
+    /// One half-cycle as a machine drives it: count first, then advance
+    /// the clock. Returns the count the gate would read.
+    fn half_cycle(e: &mut UlaEngine, addr: u16, mreq: bool, iorq: bool) -> u8 {
+        e.track_mcycle_fall(addr, mreq, iorq);
+        let count = e.mcycle_fall;
+        e.track_z80_clock(iorq, mreq, false);
+        count
+    }
+
+    #[test]
+    fn mcycle_fall_counts_strobe_free_falling_edges_of_one_address() {
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        // The first half-cycle is a rising one: nothing is counted.
+        assert_eq!(half_cycle(&mut e, 0x8000, false, false), 0);
+        assert_eq!(e.prev_fall_addr, 0);
+
+        // Memory cycle: one strobe-free falling edge, then /MREQ.
+        assert_eq!(half_cycle(&mut e, 0x4000, false, false), 1);
+        assert_eq!(e.prev_fall_addr, 0x4000);
+        half_cycle(&mut e, 0x4000, true, false);
+        assert_eq!(half_cycle(&mut e, 0x4000, true, false), 0);
+
+        // I/O cycle on a new address: two strobe-free falls, then /IORQ.
+        half_cycle(&mut e, 0x40FE, false, false);
+        assert_eq!(half_cycle(&mut e, 0x40FE, false, false), 1);
+        half_cycle(&mut e, 0x40FE, false, false);
+        assert_eq!(half_cycle(&mut e, 0x40FE, false, false), 2);
+        half_cycle(&mut e, 0x40FE, false, true);
+        assert_eq!(half_cycle(&mut e, 0x40FE, false, true), 0);
+
+        // An Internal M-cycle on the stale address never starts a run.
+        half_cycle(&mut e, 0x40FE, false, false);
+        assert_eq!(half_cycle(&mut e, 0x40FE, false, false), 0);
+        half_cycle(&mut e, 0x40FE, false, false);
+        assert_eq!(half_cycle(&mut e, 0x40FE, false, false), 0);
+    }
+
+    #[test]
+    fn mcycle_fall_freezes_while_the_cpu_is_stalled() {
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.z80_clock_high = false;
+        e.track_mcycle_fall(0x4000, false, false);
+        assert_eq!(e.mcycle_fall, 1);
+
+        e.cpu_clock = false;
+        e.track_mcycle_fall(0x4000, false, false);
+        e.track_mcycle_fall(0x5000, false, false);
+        assert_eq!(e.mcycle_fall, 1);
+        assert_eq!(e.prev_fall_addr, 0x4000);
+
+        // On a rising half-cycle the count is left alone too.
+        e.cpu_clock = true;
+        e.z80_clock_high = true;
+        e.track_mcycle_fall(0x5000, true, false);
+        assert_eq!(e.mcycle_fall, 1);
+    }
+
+    #[test]
+    fn mcycle_fall_saturates_rather_than_wrapping() {
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        e.z80_clock_high = false;
+        e.prev_fall_addr = 0x4000;
+        e.mcycle_fall = u8::MAX;
+        e.track_mcycle_fall(0x4000, false, false);
+        assert_eq!(e.mcycle_fall, u8::MAX);
+    }
+}
