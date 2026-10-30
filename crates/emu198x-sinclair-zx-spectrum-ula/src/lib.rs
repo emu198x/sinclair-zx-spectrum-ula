@@ -269,18 +269,14 @@ pub struct UlaEngine {
     // DataLatch stage; `data_reg`/`attr_reg` are the ShiftRegister.
     // Transfer points are described in `tick_rendering`.
     //
-    // `#[serde(skip)]` on the pending fields keeps snapshot byte-encoding
-    // backward-compatible with snapshots taken before Seam 1 landed. The
-    // pipeline drains every 16-pixel cycle, so omitting it from save
-    // state at most loses a sub-cycle of rendering on the resume
-    // scanline — acceptable transient state.
+    // Pending fetches are real pipeline state. They must survive a save
+    // taken between a memory fetch and its transfer to DataLatch; otherwise
+    // the first resumed pixels differ from uninterrupted execution.
     pub data_reg: u8,
     pub attr_reg: u8,
     pub data_latch: u8,
     pub attr_latch: u8,
-    #[serde(skip)]
     pub data_latch_pending: u8,
-    #[serde(skip)]
     pub attr_latch_pending: u8,
     pub data_addr: u16,
     pub attr_addr: u16,
@@ -295,11 +291,8 @@ pub struct UlaEngine {
     /// OutB) instantly via `write_fe`, but the *displayed* colour only
     /// catches up at the next AOLatch trigger. This is the silicon
     /// basis for the well-known 8-pixel border-write granularity that
-    /// border-effect demos rely on. `#[serde(skip)]` keeps snapshot
-    /// byte-encoding backward compatible — the AOLatch state drains
-    /// every 8 pixels so resume reseeds from `border` within at most
-    /// one character cell.
-    #[serde(skip)]
+    /// border-effect demos rely on. Preserve the latched value separately
+    /// from BorderLatch so a resume retains the in-flight colour delay.
     pub border_aolatch: u8,
 
     /// VidEN: `/Border` delayed by one character cell (8 CLK7 = 4 T-states).
@@ -311,9 +304,7 @@ pub struct UlaEngine {
     /// uniformly on every active scanline, and the visual offset from
     /// VidEN's one-character delay is already accounted for by
     /// `fetch_start` / `fetch_end`. Field reserved for future fidelity
-    /// work (e.g. AOLatch border timing); `#[serde(skip)]` keeps
-    /// snapshot byte-encoding backward compatible.
-    #[serde(skip)]
+    /// work (e.g. AOLatch border timing); it remains explicit saved state.
     pub vid_en: bool,
     // Contention tracking
     /// `MREQT23` — Smith Chapter 18, pp. 192-193 and Figure 18-15.
@@ -372,15 +363,11 @@ pub struct UlaEngine {
     /// M-cycle — strobe-free throughout, and carrying the previous cycle's
     /// stale address — from ever reaching 2.
     ///
-    /// Not serialised: it is derived within-M-cycle state that reconstructs
-    /// itself on the next address change, and adding a field to the save
-    /// state's postcard layout to carry it would be a format break for
-    /// nothing.
-    #[serde(skip)]
+    /// Saved with the previous falling address so a restore during an
+    /// M-cycle preserves the diagnostic phase before the next address change.
     pub mcycle_fall: u8,
     /// The address seen on the previous falling half-cycle, for
     /// [`Self::mcycle_fall`]'s new-address test.
-    #[serde(skip)]
     pub prev_fall_addr: u16,
 
     /// Framebuffer width (352 for standard, 704 for Timex hi-res capable).
@@ -397,7 +384,6 @@ pub struct UlaEngine {
     /// Hi-res pending-latch slot — mirrors `data_latch_pending` for the
     /// $6000-screen path used by Timex SCLD hi-res mode. Routed through
     /// the same two-stage pipeline so the two streams emerge in lock-step.
-    #[serde(skip)]
     pub data_latch_pending2: u8,
 
     /// Timing configuration for this variant.
@@ -1454,7 +1440,7 @@ mod engine_paths {
 
     /// A restored engine has no timing config of its own: the field is
     /// skipped, so it falls back to 48K timing until the machine calls
-    /// `set_config`. The skipped pipeline fields come back as zero.
+    /// `set_config`. Mutable pipeline fields retain their saved values.
     #[test]
     fn deserialized_engine_uses_48k_timing_until_set_config() {
         use Field::{B, U};
@@ -1476,20 +1462,27 @@ mod engine_paths {
             U(0),
             U(0),
             U(0),
-            U(0), // data_addr
+            U(0xa5), // data_latch_pending
+            U(0x47), // attr_latch_pending
+            U(0),    // data_addr
             U(0),
             B(false), // video
             B(true),  // border_active
+            U(2),     // border_aolatch
+            B(true),  // vid_en
             B(false),
             B(false),
             B(false),
             B(false),
             B(false),
+            U(2),                   // mcycle_fall
+            U(0xc123),              // prev_fall_addr
             U(SCREEN_WIDTH as u64), // fb_width
             U(0),
             U(0),
             U(0),
             U(0),
+            U(0x3c), // data_latch_pending2
         ];
         let de = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
             fields.into_iter(),
@@ -1501,8 +1494,17 @@ mod engine_paths {
             (e.pixel, e.scan, e.border, e.flash_counter),
             (447, 10, 2, 3)
         );
-        assert_eq!(e.border_aolatch, 0, "skipped AOLatch defaults to zero");
-        assert_eq!(e.mcycle_fall, 0);
+        assert_eq!(
+            (
+                e.data_latch_pending,
+                e.attr_latch_pending,
+                e.data_latch_pending2
+            ),
+            (0xa5, 0x47, 0x3c)
+        );
+        assert_eq!(e.border_aolatch, 2);
+        assert!(e.vid_en);
+        assert_eq!((e.mcycle_fall, e.prev_fall_addr), (2, 0xc123));
 
         // A 48K line has 448 pixels, so pixel 447 wraps to the next line.
         let mem = Ram::with(&[]);
