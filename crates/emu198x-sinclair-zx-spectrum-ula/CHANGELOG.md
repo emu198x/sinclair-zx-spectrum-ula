@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/emu198x/sinclair-zx-spectrum-ula/compare/emu198x-sinclair-zx-spectrum-ula-v0.2.1...emu198x-sinclair-zx-spectrum-ula-v0.3.0) - 2026-11-03
+
 ### Fixed
 
 - **Breaking:** snow hits one fetch pair, decided where the refresh begins: one beginning at fetch phase 3 gives the first pair (an odd column) the refresh's row; one beginning at phase 7 makes the second pair repeat the first. Three fields are added to the serialized engine, so 0.2 saves must be rejected
