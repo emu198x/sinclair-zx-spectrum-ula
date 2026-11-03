@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/emu198x/sinclair-zx-spectrum-ula/compare/emu198x-sinclair-zx-spectrum-ula-v0.2.1...emu198x-sinclair-zx-spectrum-ula-v0.2.2) - 2026-11-03
+
+### Fixed
+
+- keep snowed screen bytes near the ones the ULA meant to read
+
 ### Fixed
 
 - snow corrupts only the video fetch's DRAM row (A0–A6, from `R[6:0]`), keeping the ULA's column, instead of reading the whole refresh address

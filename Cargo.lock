@@ -10,7 +10,7 @@ checksum = "47655193f66d0286491d3f3d8e7155c1e3c01451d3b924aae70bbea5896c3af5"
 
 [[package]]
 name = "emu198x-sinclair-zx-spectrum-ula"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "emu198x-bus-sinclair-zx-spectrum",
  "serde",
