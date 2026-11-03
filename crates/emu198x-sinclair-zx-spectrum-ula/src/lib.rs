@@ -65,7 +65,9 @@ use emu198x_bus_sinclair_zx_spectrum::timing::{SCREEN_HEIGHT, SCREEN_WIDTH};
 /// Bumps planned: further versions per substantive rendering change.
 /// See the architecture review's Seam 4 for the re-capture discipline
 /// this constant enforces.
-pub const FRAME_ROUTING_VERSION: u32 = 5;
+/// **Version 6**: documented Timex mode 6 shifts a complete primary byte,
+/// then a complete secondary byte, with unbright complementary paper/border.
+pub const FRAME_ROUTING_VERSION: u32 = 6;
 
 /// Timing and layout constants for a specific ULA variant.
 #[derive(Clone, Debug)]
@@ -558,6 +560,14 @@ pub fn floating_bus_byte(
 }
 
 impl UlaEngine {
+    /// Immutable timing configuration currently attached by the machine owner.
+    /// This reference is not serialized; restore must reattach the board's
+    /// configuration with [`Self::set_config`].
+    #[must_use]
+    pub fn config(&self) -> &'static UlaConfig {
+        self.config
+    }
+
     /// Re-install the timing config after deserialization.
     pub fn set_config(&mut self, config: &'static UlaConfig) {
         self.config = config;
@@ -623,6 +633,22 @@ impl UlaEngine {
     #[inline]
     pub fn compute_attr_addr(scan: u16) -> u16 {
         0x1800 | ((scan & 0xF8) << 2)
+    }
+
+    // TS2068 Technical Manual §5.2.3: even character columns come from
+    // DF1 and odd columns from DF2. Two serial pixels leave per ULA clock;
+    // each eight-clock cell therefore consumes the primary byte, then the
+    // secondary byte. Pixel phase and both saved registers fully retain it.
+    fn shift_mode6_pair(&mut self) -> (u8, u8) {
+        let column_phase = (self.pixel - self.config.screen_start) & 7;
+        let register = if column_phase < 4 {
+            &mut self.data_reg
+        } else {
+            &mut self.data_reg2
+        };
+        let pixels = ((*register >> 7) & 1, (*register >> 6) & 1);
+        *register <<= 2;
+        pixels
     }
 
     /// Run the rendering portion of a ULA tick: video fetch, pixel output,
@@ -794,13 +820,20 @@ impl UlaEngine {
 
             if in_screen && hires && hscale == 2 {
                 // Hi-res on wide framebuffer: 2 pixels per ULA clock
-                let bit1 = (self.data_reg >> 7) & 1;
-                let bit2 = (self.data_reg2 >> 7) & 1;
-                self.data_reg <<= 1;
-                self.data_reg2 <<= 1;
+                let documented_mode6 = self.scld_mode == 6;
+                let (bit1, bit2) = if documented_mode6 {
+                    self.shift_mode6_pair()
+                } else {
+                    // Preserve the existing, unqualified reserved-mode decoder.
+                    let pair = ((self.data_reg >> 7) & 1, (self.data_reg2 >> 7) & 1);
+                    self.data_reg <<= 1;
+                    self.data_reg2 <<= 1;
+                    pair
+                };
                 let ink = self.scld_hires_ink;
-                let px_even = if bit1 != 0 { ink } else { 0 };
-                let px_odd = if bit2 != 0 { ink } else { 0 };
+                let paper = if documented_mode6 { ink ^ 7 } else { 0 };
+                let px_even = if bit1 != 0 { ink } else { paper };
+                let px_odd = if bit2 != 0 { ink } else { paper };
                 let off = fb_y as usize * self.fb_width + fb_x as usize;
                 if off + 1 < framebuffer.len() {
                     framebuffer[off] = px_even;
@@ -828,16 +861,25 @@ impl UlaEngine {
                 // transfer comment above).
                 let off = fb_y as usize * self.fb_width + fb_x as usize;
                 if off < framebuffer.len() {
-                    framebuffer[off] = self.border_aolatch;
+                    let border = if self.scld_mode == 6 {
+                        self.scld_hires_ink ^ 7
+                    } else {
+                        self.border_aolatch
+                    };
+                    framebuffer[off] = border;
                     if hscale == 2 && off + 1 < framebuffer.len() {
-                        framebuffer[off + 1] = self.border_aolatch;
+                        framebuffer[off + 1] = border;
                     }
                 }
             }
         } else if self.scan < 192 && self.pixel >= cfg.screen_start && self.pixel < cfg.screen_end {
-            self.data_reg <<= 1;
-            if hires {
-                self.data_reg2 <<= 1;
+            if hires && hscale == 2 && self.scld_mode == 6 {
+                self.shift_mode6_pair();
+            } else {
+                self.data_reg <<= 1;
+                if hires {
+                    self.data_reg2 <<= 1;
+                }
             }
         }
 
@@ -1734,6 +1776,153 @@ mod engine_paths {
             assert_eq!(fb[row + 96 + 2 * i], even[i], "even pixel {i}");
             assert_eq!(fb[row + 97 + 2 * i], odd[i], "odd pixel {i}");
         }
+    }
+
+    // TS2068 Technical Manual Table 3.2.2-1 and §5.2.3: mode 6
+    // concatenates primary/secondary eight-pixel columns, uses complementary
+    // paper, forces bright/flash off, and fixes the border to paper.
+    #[test]
+    fn documented_attribute_modes_select_their_independent_pixels_and_colours() {
+        // Scan 9, first character: primary bitmap $4120, secondary $6120,
+        // ordinary attribute rows $5820/$7820. In mode 2, $6120 is the
+        // per-pixel-row attribute instead of a second bitmap.
+        let memory = Ram::with(&[
+            (0x4120, 0xa0),
+            (0x5820, 0x5a),
+            (0x6120, 0x30),
+            (0x7820, 0x25),
+        ]);
+        for (mode, expected) in [
+            (0, [10, 11, 10, 11, 11, 11, 11, 11]),
+            (1, [4, 4, 5, 5, 4, 4, 4, 4]),
+            (2, [0, 6, 0, 6, 6, 6, 6, 6]),
+        ] {
+            let mut engine = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+            engine.scan = 9;
+            engine.scld_mode = mode;
+            let mut framebuffer = wide_fb();
+            tick_until(&mut engine, &memory, &mut framebuffer, 20);
+            let row = (9 + 48) * SCREEN_WIDTH_HIRES;
+            let expected: Vec<_> = expected.into_iter().flat_map(|p| [p, p]).collect();
+            assert_eq!(
+                &framebuffer[row + 96..row + 112],
+                expected,
+                "documented mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode6_reads_complete_alternating_columns_across_all_512_pixels() {
+        for (scan, offset) in [(0u16, 0u16), (9, 0x120), (64, 0x800), (191, 0x17e0)] {
+            let mut locations = Vec::new();
+            let mut expected = Vec::new();
+            for column in 0..32u16 {
+                let primary = 0x81u8.rotate_left(u32::from(column % 8));
+                let secondary = 0x3cu8.rotate_right(u32::from(column % 8));
+                locations.extend([
+                    (0x4000 + offset + column, primary),
+                    (0x6000 + offset + column, secondary),
+                ]);
+                for byte in [primary, secondary] {
+                    for bit in (0..8).rev() {
+                        expected.push(if byte & (1 << bit) != 0 { 2 } else { 5 });
+                    }
+                }
+            }
+            let memory = Ram::with(&locations);
+            let mut engine = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+            engine.scan = scan;
+            engine.scld_mode = 6;
+            engine.scld_hires_ink = 2;
+            let mut framebuffer = wide_fb();
+            tick_until(&mut engine, &memory, &mut framebuffer, 268);
+            let row = usize::from(scan + 48) * SCREEN_WIDTH_HIRES;
+            assert_eq!(&framebuffer[row + 96..row + 608], expected);
+        }
+    }
+    #[test]
+    fn mode6_has_complementary_paper_and_border_for_every_unbright_ink() {
+        let memory = Ram::with(&[(0x4000, 0x80), (0x6000, 0x01), (0x5800, 0xff), (0x7800, 0)]);
+        for ink in 0..8 {
+            let mut engine = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+            engine.scld_mode = 6;
+            engine.scld_hires_ink = ink;
+            engine.flash_active = true;
+            engine.border = 3;
+            let mut framebuffer = wide_fb();
+            tick_until(&mut engine, &memory, &mut framebuffer, 20);
+            let row = 48 * SCREEN_WIDTH_HIRES;
+            let paper = ink ^ 7;
+            assert_eq!(
+                &framebuffer[row + 72..row + 96],
+                vec![paper; 24],
+                "ink {ink}: fixed paper-coloured border"
+            );
+            let mut expected = vec![paper; 16];
+            expected[0] = ink;
+            expected[15] = ink;
+            assert_eq!(
+                &framebuffer[row + 96..row + 112],
+                expected,
+                "ink {ink}: complete primary then secondary bytes"
+            );
+        }
+    }
+    #[test]
+    fn clipped_mode6_pixels_still_consume_both_saved_serial_registers() {
+        const CLIPPED: UlaConfig = UlaConfig {
+            fb_x_hblank_start: 14,
+            ..CONFIG_TIMEX_PAL
+        };
+        let memory = Ram::with(&[(0x4000, 0xa5), (0x6000, 0x3c)]);
+        let mut visible = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+        let mut clipped = UlaEngine::new_hires(&CLIPPED);
+        visible.scld_mode = 6;
+        clipped.scld_mode = 6;
+        let mut a = wide_fb();
+        let mut b = wide_fb();
+        tick_until(&mut visible, &memory, &mut a, 20);
+        tick_until(&mut clipped, &memory, &mut b, 20);
+        assert_eq!(
+            (visible.data_reg, visible.data_reg2),
+            (clipped.data_reg, clipped.data_reg2)
+        );
+        assert_eq!((clipped.data_reg, clipped.data_reg2), (0, 0));
+        assert_eq!(b[48 * SCREEN_WIDTH_HIRES + 100], UNTOUCHED);
+        assert_ne!(a[48 * SCREEN_WIDTH_HIRES + 100], UNTOUCHED);
+        assert_eq!(visible.config().lines_per_frame, 312);
+    }
+
+    #[test]
+    fn mode6_border_tracks_the_mode_colour_without_overwriting_fe_border() {
+        let memory = Ram::with(&[]);
+        let mut engine = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
+        let mut framebuffer = wide_fb();
+        let row = 48 * SCREEN_WIDTH_HIRES;
+        engine.tick_rendering(&memory, &mut framebuffer, None);
+        assert_eq!(&framebuffer[row + 72..row + 74], &[7, 7]);
+        engine.scld_mode = 6;
+        engine.scld_hires_ink = 1;
+        engine.tick_rendering(&memory, &mut framebuffer, None);
+        assert_eq!(&framebuffer[row + 74..row + 76], &[6, 6]);
+        engine.write_fe(3);
+        engine.scld_hires_ink = 4;
+        engine.tick_rendering(&memory, &mut framebuffer, None);
+        assert_eq!(&framebuffer[row + 76..row + 78], &[3, 3]);
+        engine.scld_mode = 0;
+        engine.tick_rendering(&memory, &mut framebuffer, None);
+        assert_eq!(
+            &framebuffer[row + 78..row + 80],
+            &[7, 7],
+            "ordinary AOLatch still holds its earlier FE value"
+        );
+        engine.tick_rendering(&memory, &mut framebuffer, None);
+        assert_eq!(
+            &framebuffer[row + 80..row + 82],
+            &[3, 3],
+            "normal border resumes its retained FE value"
+        );
     }
 
     /// Standard rendering on a wide framebuffer doubles every pixel.
