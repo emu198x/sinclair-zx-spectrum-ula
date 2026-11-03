@@ -387,6 +387,16 @@ pub struct UlaEngine {
     /// $6000-screen path used by Timex SCLD hi-res mode. Routed through
     /// the same two-stage pipeline so the two streams emerge in lock-step.
     pub data_latch_pending2: u8,
+    /// Snow in progress, if any: `SNOW_ROW` or `SNOW_DUPLICATE`, else 0.
+    /// A refresh that begins just before a fetch pair's row is latched
+    /// corrupts that whole pair, so the corruption outlives the tick that
+    /// caused it. See `begin_snow`.
+    pub snow_mode: u8,
+    /// The DRAM row (A0–A6) snowed fetches read while `snow_mode` is set.
+    pub snow_row: u8,
+    /// Whether the previous tick carried a snow-armed refresh, so a refresh
+    /// can be seen beginning.
+    pub snow_was_armed: bool,
 
     /// Timing configuration for this variant.
     /// Skipped during serialization — the owning machine must re-set this
@@ -529,6 +539,21 @@ pub fn snowed_fetch_address(intended: u16, refresh: u16) -> u16 {
     (intended & 0xFF80) | (refresh & 0x007F)
 }
 
+/// `UlaEngine::snow_mode`: the first fetch pair reads with the refresh's row.
+pub const SNOW_ROW: u8 = 1;
+/// `UlaEngine::snow_mode`: the second fetch pair reads with the first pair's
+/// row, so the even column repeats the odd one.
+pub const SNOW_DUPLICATE: u8 = 2;
+
+/// Fetch phase at which a beginning refresh snows the first pair (fetches at
+/// 8 and 10), and the one at which it duplicates into the second (12 and 14).
+/// A refresh begins on an odd phase, one tick before SpecIde's 4 and 8, the
+/// same offset the 6C001E applies to contention. Real 48Ks snow only in odd
+/// columns and duplicate into even ones (Weiv and others, "Exact emulation of
+/// the Snow effect", Spectrum Computing forum, 2022–23).
+const SNOW_ROW_PHASE: usize = 3;
+const SNOW_DUPLICATE_PHASE: usize = 7;
+
 /// Spectron/FUSE floating-bus model byte at frame T-state `frame_tstate`
 /// (FUSE convention). Idle (`0xFF`) outside the four fetch slots of each
 /// 8-T group and outside the 192-line display; bitmap/attr otherwise.
@@ -631,6 +656,9 @@ impl UlaEngine {
             data_reg2: 0,
             data_latch2: 0,
             data_latch_pending2: 0,
+            snow_mode: 0,
+            snow_row: 0,
+            snow_was_armed: false,
             config,
         }
     }
@@ -738,6 +766,33 @@ impl UlaEngine {
         if (p & 0x07) == 4 {
             self.border_aolatch = self.border;
         }
+
+        // === Snow ===
+        // Only a refresh that begins just before a pair's row is latched
+        // corrupts it, and then the whole pair, so snow is decided here
+        // and held, not taken from each tick's refresh.
+        let armed = snow.is_some();
+        let begins = armed && !self.snow_was_armed;
+        self.snow_was_armed = armed;
+        if self.video {
+            let fetch_phase = (phase + 8 - usize::from(cfg.fetch_start)) & 0x0f;
+            match fetch_phase {
+                SNOW_ROW_PHASE if begins => {
+                    self.snow_mode = SNOW_ROW;
+                    self.snow_row = snow.map_or(0, |r| (r & 0x7F) as u8);
+                }
+                SNOW_DUPLICATE_PHASE if begins => {
+                    self.snow_mode = SNOW_DUPLICATE;
+                    self.snow_row = (self.data_addr & 0x7E) as u8;
+                }
+                12 if self.snow_mode == SNOW_ROW => self.snow_mode = 0,
+                0 => self.snow_mode = 0,
+                _ => {}
+            }
+        } else {
+            self.snow_mode = 0;
+        }
+        let snow = (self.snow_mode != 0).then_some(u16::from(self.snow_row));
 
         // === Video fetch ===
         if self.video {
@@ -1189,47 +1244,81 @@ mod tests {
         }
     }
 
-    /// When snow is armed, the bitmap fetch keeps its column (A7–A13) but
-    /// takes its row (A0–A6) from the refresh address. The fetch counter
-    /// still advances either way.
-    #[test]
-    fn snow_replaces_only_the_row_of_the_bitmap_fetch() {
+    /// The four bytes one 16-pixel fetch cycle reads (pair 1's bitmap and
+    /// attribute, then pair 2's), with a refresh to `$7A99` (row `$19`)
+    /// beginning at fetch phase `begins` and lasting two T-states, or
+    /// already under way when the cycle starts if `begins` is `None`.
+    /// Pair 1 is meant to read `$4142`/`$5942`, pair 2 `$4143`/`$5943`.
+    fn fetch_cycle_with_refresh(begins: Option<usize>) -> [u8; 4] {
         let mem = AddrLowMemory;
         let mut fb = vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT];
+        let mut e = UlaEngine::new(&CONFIG_48K);
+        // Pixel 16 is phase 0 and not `fetch_start`, so the fetch
+        // addresses stay as set here.
+        e.video = true;
+        e.scan = 100;
+        e.pixel = 16;
+        e.data_addr = 0x0142;
+        e.attr_addr = 0x1942;
+        e.scld_mode = 0;
+        e.snow_was_armed = begins.is_none();
+        let mut read = [0u8; 4];
+        for phase in 0..16 {
+            let armed = match begins {
+                Some(b) => (b..b + 4).contains(&phase),
+                None => phase < 4,
+            };
+            e.tick_rendering(&mem, &mut fb, armed.then_some(0x7A99));
+            if let Some(i) = [8, 10, 12, 14].iter().position(|&f| f == phase) {
+                read[i] = e.bus_data;
+            }
+        }
+        read
+    }
 
-        // Pixel 12 is a bitmap-fetch phase (MEM_TABLE[12] == false,
-        // phase & 0x02 == 0) that is NOT `fetch_start` (8), so it doesn't
-        // recompute `data_addr` — letting us pin a known fetch address. A
-        // visible scanline (scan < 192) keeps `video` set.
-        let setup = |e: &mut UlaEngine| {
-            e.video = true;
-            e.scan = 100;
-            e.pixel = 12;
-            e.data_addr = 0x0142;
-            e.scld_mode = 0;
-        };
-
-        // No snow: reads the intended address $4000 | (0x142 & 0x1FFF)
-        // = $4142 → low byte $42.
-        let mut clean = UlaEngine::new(&CONFIG_48K);
-        setup(&mut clean);
-        clean.tick_rendering(&mem, &mut fb, None);
-        assert_eq!(clean.bus_data, 0x42, "clean fetch reads the screen address");
-
-        // Snow armed at refresh address $7A99 (I = $7A, R = $99): the
-        // column stays $4142's ($4100), the row is R[6:0] ($19), so the
-        // ULA reads $4119 → low byte $19, not $99 from $7A99.
-        let mut snowy = UlaEngine::new(&CONFIG_48K);
-        setup(&mut snowy);
-        snowy.tick_rendering(&mem, &mut fb, Some(0x7A99));
+    /// Smith pp. 246–248: the collision corrupts the fetch's DRAM row
+    /// (A0–A6) and leaves its column. A refresh that begins just before
+    /// pair 1's row is latched gives that pair, bitmap and attribute, the
+    /// refresh's row; pair 2 reads cleanly. So snow lands in odd columns.
+    #[test]
+    fn a_refresh_beginning_at_phase_3_snows_the_first_pair_with_its_row() {
         assert_eq!(
-            snowy.bus_data, 0x19,
-            "snow replaces only the row of the fetch address"
+            fetch_cycle_with_refresh(None),
+            [0x42, 0x42, 0x43, 0x43],
+            "no refresh begins: clean"
         );
         assert_eq!(
-            snowy.data_addr, 0x0143,
-            "the fetch counter still advances under snow"
+            fetch_cycle_with_refresh(Some(3)),
+            [0x19, 0x19, 0x43, 0x43],
+            "pair 1 reads row $19 in its own column; pair 2 is clean"
         );
+    }
+
+    /// A refresh beginning as pair 1's row is latched leaves pair 1 alone
+    /// and makes pair 2 reuse pair 1's row, so the even column repeats the
+    /// odd one.
+    #[test]
+    fn a_refresh_beginning_at_phase_7_duplicates_the_first_pair_into_the_second() {
+        assert_eq!(fetch_cycle_with_refresh(Some(7)), [0x42, 0x42, 0x42, 0x42]);
+    }
+
+    /// Refreshes begin on odd phases. Beginning anywhere else, or already
+    /// under way, they don't corrupt a fetch, however much they overlap it.
+    #[test]
+    fn a_refresh_beginning_elsewhere_snows_nothing() {
+        for begins in [1, 5, 9, 11, 13] {
+            assert_eq!(
+                fetch_cycle_with_refresh(Some(begins)),
+                [0x42, 0x42, 0x43, 0x43],
+                "refresh beginning at phase {begins}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snowed_fetch_keeps_its_column_and_takes_the_refresh_row() {
+        assert_eq!(snowed_fetch_address(0x4142, 0x7A99), 0x4119);
+        assert_eq!(snowed_fetch_address(0x5943, 0x40FF), 0x597F);
     }
 
     /// `floating_bus_byte` reproduces the Spectron/FUSE model: idle
@@ -1537,7 +1626,10 @@ mod engine_paths {
             U(0),
             U(0),
             U(0),
-            U(0x3c), // data_latch_pending2
+            U(0x3c),  // data_latch_pending2
+            U(0),     // snow_mode
+            U(0),     // snow_row
+            B(false), // snow_was_armed
         ];
         let de = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
             fields.into_iter(),
