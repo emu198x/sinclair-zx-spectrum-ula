@@ -501,8 +501,9 @@ fn default_config() -> &'static UlaConfig {
 /// address in screen-RAM range — `cpu_rfsh` is asserted (T3/T4 of an M1,
 /// `I:R` on the bus) and the I register is in `$40..=$7F`, i.e. the
 /// address falls in `$4000..=$7FFF`. In that case a colliding CPU `/RAS`
-/// corrupts the in-flight video fetch and the ULA reads from the refresh
-/// address instead. `None` otherwise. ULAs that exhibit snow (Ferranti
+/// corrupts the in-flight video fetch's DRAM row address; see
+/// [`snowed_fetch_address`] for the byte the ULA then reads. `None`
+/// otherwise. ULAs that exhibit snow (Ferranti
 /// 48K, Sinclair 128K) feed the result to `tick_rendering`; the Amstrad
 /// gate array and the clone ULAs pass `None`.
 ///
@@ -515,6 +516,17 @@ pub fn snow_address(cpu_rfsh: bool, cpu_addr: u16) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// The address a snowed video fetch reads. The collision corrupts only the
+/// DRAM row address (Smith, pp. 246–248: "video bytes to be fetched from the
+/// wrong row address"). On the 4116s the row is A0–A6, which the refresh
+/// drives from `R[6:0]`; the column, A7–A13, is still the ULA's own. So the
+/// wrong byte comes from the same 128-byte block as the intended one, which
+/// is why a snowed picture stays recognisable.
+#[must_use]
+pub fn snowed_fetch_address(intended: u16, refresh: u16) -> u16 {
+    (intended & 0xFF80) | (refresh & 0x007F)
 }
 
 /// Spectron/FUSE floating-bus model byte at frame T-state `frame_tstate`
@@ -746,9 +758,9 @@ impl UlaEngine {
                     self.data_addr = self.data_addr.wrapping_add(1);
                     let base = if dual && !hires { 0x6000u16 } else { 0x4000u16 };
                     // Snow: a colliding refresh /RAS corrupts the fetched
-                    // row address, so the ULA reads from the refresh
-                    // address instead. The fetch counter still advances.
-                    let addr = snow.unwrap_or(base | (a & 0x1FFF));
+                    // row address. The fetch counter still advances.
+                    let intended = base | (a & 0x1FFF);
+                    let addr = snow.map_or(intended, |r| snowed_fetch_address(intended, r));
                     self.bus_data = memory.read_screen(addr);
                     self.data_latch_pending = self.bus_data;
 
@@ -781,7 +793,7 @@ impl UlaEngine {
                             0x4000 | (a & 0x1FFF)
                         };
                         // Snow corrupts the attribute fetch the same way.
-                        let addr = snow.unwrap_or(intended);
+                        let addr = snow.map_or(intended, |r| snowed_fetch_address(intended, r));
                         self.bus_data = memory.read_screen(addr);
                         self.attr_latch_pending = self.bus_data;
                     }
@@ -1177,11 +1189,11 @@ mod tests {
         }
     }
 
-    /// When snow is armed, the bitmap fetch reads from the refresh
-    /// address instead of the intended screen address — the visible
-    /// corruption. The fetch counter still advances either way.
+    /// When snow is armed, the bitmap fetch keeps its column (A7–A13) but
+    /// takes its row (A0–A6) from the refresh address. The fetch counter
+    /// still advances either way.
     #[test]
-    fn snow_corrupts_the_bitmap_fetch_address() {
+    fn snow_replaces_only_the_row_of_the_bitmap_fetch() {
         let mem = AddrLowMemory;
         let mut fb = vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT];
 
@@ -1204,14 +1216,15 @@ mod tests {
         clean.tick_rendering(&mem, &mut fb, None);
         assert_eq!(clean.bus_data, 0x42, "clean fetch reads the screen address");
 
-        // Snow armed at refresh address $4099: the ULA reads $4099
-        // instead → low byte $99.
+        // Snow armed at refresh address $7A99 (I = $7A, R = $99): the
+        // column stays $4142's ($4100), the row is R[6:0] ($19), so the
+        // ULA reads $4119 → low byte $19, not $99 from $7A99.
         let mut snowy = UlaEngine::new(&CONFIG_48K);
         setup(&mut snowy);
-        snowy.tick_rendering(&mem, &mut fb, Some(0x4099));
+        snowy.tick_rendering(&mem, &mut fb, Some(0x7A99));
         assert_eq!(
-            snowy.bus_data, 0x99,
-            "snow redirects the fetch to the refresh address"
+            snowy.bus_data, 0x19,
+            "snow replaces only the row of the fetch address"
         );
         assert_eq!(
             snowy.data_addr, 0x0143,
