@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/emu198x/sinclair-zx-spectrum-ula/compare/emu198x-sinclair-zx-spectrum-ula-v0.2.0...emu198x-sinclair-zx-spectrum-ula-v0.2.1) - 2026-11-03
+
+### Fixed
+
+- Render Timex mode 6 as complete character columns
+
 ## 0.1.0
 
 ### Added
