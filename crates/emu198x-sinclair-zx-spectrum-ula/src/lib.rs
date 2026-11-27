@@ -913,6 +913,10 @@ impl UlaEngine {
                 let flash = attr_flash(attr) && self.flash_active;
                 let bit = (self.data_reg >> 7) & 1;
                 self.data_reg <<= 1;
+                // Clock both shifters in hi-res even on the narrow fallback.
+                if hires {
+                    self.data_reg2 <<= 1;
+                }
                 let pixel_idx = if (bit != 0) ^ flash { ink } else { paper };
                 let off = fb_y as usize * self.fb_width + fb_x as usize;
                 if off < framebuffer.len() {
@@ -1997,6 +2001,30 @@ mod engine_paths {
         assert_eq!(b[48 * SCREEN_WIDTH_HIRES + 100], UNTOUCHED);
         assert_ne!(a[48 * SCREEN_WIDTH_HIRES + 100], UNTOUCHED);
         assert_eq!(visible.config().lines_per_frame, 312);
+    }
+
+    #[test]
+    fn narrow_hires_pixels_clock_both_registers_even_when_clipped() {
+        const CLIPPED: UlaConfig = UlaConfig {
+            fb_x_hblank_start: 14,
+            ..CONFIG_TIMEX_PAL
+        };
+        let memory = Ram::with(&[(0x4000, 0xa5), (0x6000, 0x3c)]);
+        for mode in [4, 6] {
+            let mut visible = UlaEngine::new(&CONFIG_TIMEX_PAL);
+            let mut clipped = UlaEngine::new(&CLIPPED);
+            visible.scld_mode = mode;
+            clipped.scld_mode = mode;
+            let mut visible_fb = standard_fb();
+            let mut clipped_fb = standard_fb();
+            tick_until(&mut visible, &memory, &mut visible_fb, 16);
+            tick_until(&mut clipped, &memory, &mut clipped_fb, 16);
+            let pixel = 48 * SCREEN_WIDTH + 50;
+            assert_ne!(visible_fb[pixel], UNTOUCHED);
+            assert_eq!(clipped_fb[pixel], UNTOUCHED);
+            assert_eq!((visible.data_reg, visible.data_reg2), (0x50, 0xc0));
+            assert_eq!((clipped.data_reg, clipped.data_reg2), (0x50, 0xc0));
+        }
     }
 
     #[test]
