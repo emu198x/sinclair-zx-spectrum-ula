@@ -398,11 +398,10 @@ pub struct UlaEngine {
     /// can be seen beginning.
     pub snow_was_armed: bool,
 
-    /// Timing configuration for this variant.
-    /// Skipped during serialization — the owning machine must re-set this
-    /// after deserialization via `set_config()`.
-    #[serde(skip, default = "default_config")]
-    config: &'static UlaConfig,
+    /// Timing configuration attached by the owning machine. A deserialized
+    /// engine needs `set_config()` before it can render.
+    #[serde(skip)]
+    config: Option<&'static UlaConfig>,
 }
 
 /// Sinclair VRAM reads at counter phases 8, 10, 12 and 14.
@@ -499,12 +498,6 @@ pub const DELAY_TABLE_PLUS2A: [bool; 16] = [
     false,
 ];
 
-/// Default config for serde deserialization. The owning machine must call
-/// `set_config()` immediately after deserializing to install the correct config.
-fn default_config() -> &'static UlaConfig {
-    &CONFIG_48K
-}
-
 /// Compute the snow-effect fetch override for one ULA tick.
 ///
 /// Returns `Some(refresh_addr)` when the CPU is presenting a refresh
@@ -598,16 +591,20 @@ pub fn floating_bus_byte(
 
 impl UlaEngine {
     /// Immutable timing configuration currently attached by the machine owner.
-    /// This reference is not serialized; restore must reattach the board's
-    /// configuration with [`Self::set_config`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owning machine has yet to attach the board's timing
+    /// configuration after deserialization with [`Self::set_config`].
     #[must_use]
     pub fn config(&self) -> &'static UlaConfig {
         self.config
+            .expect("restored ULA engine requires set_config before use")
     }
 
     /// Re-install the timing config after deserialization.
     pub fn set_config(&mut self, config: &'static UlaConfig) {
-        self.config = config;
+        self.config = Some(config);
     }
 
     /// Create with a wider framebuffer for Timex hi-res support.
@@ -659,7 +656,7 @@ impl UlaEngine {
             snow_mode: 0,
             snow_row: 0,
             snow_was_armed: false,
-            config,
+            config: Some(config),
         }
     }
 
@@ -679,8 +676,8 @@ impl UlaEngine {
     // DF1 and odd columns from DF2. Two serial pixels leave per ULA clock;
     // each eight-clock cell therefore consumes the primary byte, then the
     // secondary byte. Pixel phase and both saved registers fully retain it.
-    fn shift_mode6_pair(&mut self) -> (u8, u8) {
-        let column_phase = (self.pixel - self.config.screen_start) & 7;
+    fn shift_mode6_pair(&mut self, screen_start: u16) -> (u8, u8) {
+        let column_phase = (self.pixel - screen_start) & 7;
         let register = if column_phase < 4 {
             &mut self.data_reg
         } else {
@@ -701,15 +698,20 @@ impl UlaEngine {
     /// artefact. See `knowledge/systems/spectrum/snow-effect.md`. `None`
     /// for the overwhelming majority of cycles (and for ULAs that don't
     /// model snow).
+    ///
+    /// # Panics
+    ///
+    /// Panics before rendering if a deserialized engine still needs
+    /// [`Self::set_config`].
     pub fn tick_rendering(
         &mut self,
         memory: &dyn MemoryBus,
         framebuffer: &mut [u8],
         snow: Option<u16>,
     ) {
+        let cfg = self.config();
         let p = self.pixel as usize;
         let phase = p & 0x0F;
-        let cfg = self.config;
 
         // === Checkpoint events ===
         match self.pixel {
@@ -889,7 +891,7 @@ impl UlaEngine {
                 // Hi-res on wide framebuffer: 2 pixels per ULA clock
                 let documented_mode6 = self.scld_mode == 6;
                 let (bit1, bit2) = if documented_mode6 {
-                    self.shift_mode6_pair()
+                    self.shift_mode6_pair(cfg.screen_start)
                 } else {
                     // Preserve the existing, unqualified reserved-mode decoder.
                     let pair = ((self.data_reg >> 7) & 1, (self.data_reg2 >> 7) & 1);
@@ -941,7 +943,7 @@ impl UlaEngine {
             }
         } else if self.scan < 192 && self.pixel >= cfg.screen_start && self.pixel < cfg.screen_end {
             if hires && hscale == 2 && self.scld_mode == 6 {
-                self.shift_mode6_pair();
+                self.shift_mode6_pair(cfg.screen_start);
             } else {
                 self.data_reg <<= 1;
                 if hires {
@@ -951,7 +953,7 @@ impl UlaEngine {
         }
 
         if cfg.fetch_start == 8 {
-            self.update_interrupt();
+            self.update_interrupt(cfg);
         }
 
         // === Advance pixel counter ===
@@ -965,12 +967,11 @@ impl UlaEngine {
         }
 
         if cfg.fetch_start != 8 {
-            self.update_interrupt();
+            self.update_interrupt(cfg);
         }
     }
 
-    fn update_interrupt(&mut self) {
-        let cfg = self.config;
+    fn update_interrupt(&mut self, cfg: &UlaConfig) {
         if self.scan == cfg.int_scan {
             if self.pixel == cfg.int_start_pixel {
                 self.int_active = true;
@@ -1582,11 +1583,10 @@ mod engine_paths {
         }
     }
 
-    /// A restored engine has no timing config of its own: the field is
-    /// skipped, so it falls back to 48K timing until the machine calls
-    /// `set_config`. Mutable pipeline fields retain their saved values.
+    /// The existing snapshot fields restore the live pipeline. The machine
+    /// attaches its timing before the engine can resume.
     #[test]
-    fn deserialized_engine_uses_48k_timing_until_set_config() {
+    fn deserialized_engine_requires_config_before_rendering() {
         use Field::{B, U};
         // Every serialised field, in declaration order.
         let fields = vec![
@@ -1636,7 +1636,7 @@ mod engine_paths {
         );
         let mut e: UlaEngine = serde::Deserialize::deserialize(de).expect("engine deserializes");
 
-        assert!(same_timing(e.config, &CONFIG_48K));
+        assert!(std::panic::catch_unwind(|| e.config()).is_err());
         assert_eq!(
             (e.pixel, e.scan, e.border, e.flash_counter),
             (447, 10, 2, 3)
@@ -1653,16 +1653,18 @@ mod engine_paths {
         assert!(e.vid_en);
         assert_eq!((e.mcycle_fall, e.prev_fall_addr), (2, 0xc123));
 
-        // A 48K line has 448 pixels, so pixel 447 wraps to the next line.
         let mem = Ram::with(&[]);
         let mut fb = standard_fb();
-        let mut wrapped = e.clone();
-        wrapped.tick_rendering(&mem, &mut fb, None);
-        assert_eq!((wrapped.pixel, wrapped.scan), (0, 11));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            e.tick_rendering(&mem, &mut fb, None);
+        }));
+        assert!(refused.is_err());
+        assert_eq!((e.pixel, e.scan), (447, 10));
+        assert!(fb.iter().all(|&pixel| pixel == UNTOUCHED));
 
         // Under 128K timing the same pixel is not the end of the line.
         e.set_config(&CONFIG_128K);
-        assert!(same_timing(e.config, &CONFIG_128K));
+        assert!(same_timing(e.config(), &CONFIG_128K));
         e.tick_rendering(&mem, &mut fb, None);
         assert_eq!((e.pixel, e.scan), (448, 10));
     }
@@ -1673,7 +1675,7 @@ mod engine_paths {
         let hires = UlaEngine::new_hires(&CONFIG_TIMEX_PAL);
         assert_eq!(standard.fb_width, SCREEN_WIDTH);
         assert_eq!(hires.fb_width, SCREEN_WIDTH_HIRES);
-        assert!(same_timing(hires.config, &CONFIG_TIMEX_PAL));
+        assert!(same_timing(hires.config(), &CONFIG_TIMEX_PAL));
         assert_eq!(hires.border, standard.border);
         assert_eq!(hires.scld_mode, 0);
         assert!(hires.cpu_clock && hires.border_active && !hires.video);
