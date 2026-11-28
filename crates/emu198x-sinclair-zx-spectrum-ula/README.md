@@ -23,6 +23,10 @@ Licensed GPL-2.0-or-later.
 
 ## Save-state compatibility
 
+After deserializing `UlaEngine`, call `set_config` with the owning board's
+timing before querying `config()` or rendering. Both operations panic if
+timing is absent. The timing reference stays outside the serialized state.
+
 Version 0.3 adds the snow state (`snow_mode`, `snow_row`, `snow_was_armed`) to the end of the serialized engine, so its positional layout differs from 0.2. As before, callers must version their enclosing save format and reject older payloads before decoding.
 
 Version 0.2 preserves the video engine’s pending fetches, border output latch, VidEN and falling-edge phase/address in serialized state. Its positional binary layout differs from 0.1. Callers must version their enclosing save format and reject older payloads before decoding; missing pipeline state cannot be recovered exactly. The 0.2.0 transition kept the stepping API and hardware algorithms unchanged. The owner must still reattach its immutable timing configuration after restore.
